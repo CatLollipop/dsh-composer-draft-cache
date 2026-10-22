@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer draft cache",
+    "description": "Remembers unsent message drafts per workspace and per session, restores them after switching away, and drops them once sent or cleared, until the app closes."
+  }
+}

@@ -135,7 +135,281 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /* ------------------------------------------------------------------ *
+     * @plugin mentions
+     *
+     * The composer already opens an `@` menu for files and Sessions. This
+     * module registers one more `@` source that lists installed community
+     * plugins, inserts an atomic mention chip, and renders the same mention in
+     * sent messages. The Host half detects the token in the accepted user
+     * message and injects the selected plugin's metadata as runtime context,
+     * so the model knows the user explicitly chose that plugin.
+     * ------------------------------------------------------------------ */
+
+    /** Locale namespace for the menu/renderer strings. */
+    const NS = 'composer-draft-cache';
+    /** Canonical model form: `@[Title](dsh-plugin:<module name>)`. */
+    const MENTION_PREFIX = 'dsh-plugin:';
+    /** npm-style module names accepted in a mention token. */
+    const MODULE_NAME_RE = /^[A-Za-z0-9@/._-]+$/u;
+    /** Keep one inventory snapshot for a few seconds; filtering happens locally. */
+    const PLUGIN_CACHE_TTL_MS = 3000;
+    let pluginRowCache;
+
+    const DICT_ZH = {
+      'section.plugins': '插件',
+    };
+    const DICT_EN = {
+      'section.plugins': 'Plugins',
+    };
+
+    /** Localized display string from metadata (`string` or `{ en, ... }`). @param {unknown} value @param {string} localeId @returns {string | undefined} */
+    function localizedText(value, localeId) {
+      if (typeof value === 'string') return value;
+      if (value === null || typeof value !== 'object') return undefined;
+      if (typeof value[localeId] === 'string') return value[localeId];
+      if (typeof value.en === 'string') return value.en;
+      for (const key of Object.keys(value)) if (typeof value[key] === 'string') return value[key];
+      return undefined;
+    }
+
+    /** Active locale id, `en` when the locale service cannot answer. @param {any} ctx @returns {string} */
+    function currentLocaleId(ctx) {
+      try {
+        const snapshot = ctx.locale.getSnapshot();
+        if (snapshot !== null && typeof snapshot === 'object') {
+          if (typeof snapshot.id === 'string') return snapshot.id;
+          if (typeof snapshot.active === 'string') return snapshot.active;
+        }
+      } catch (error) {
+        /* fall through */
+      }
+      return 'en';
+    }
+
+    /** Whether one inventory entry is an enabled community plugin worth mentioning. @param {any} entry @returns {boolean} */
+    function isSelectablePlugin(entry) {
+      if (entry === null || typeof entry !== 'object') return false;
+      if (entry.enabled !== true || entry.fiberPhase !== 'active') return false;
+      const name = entry.moduleName;
+      if (typeof name !== 'string' || name === '') return false;
+      if (name.startsWith('@deepseek-ai/')) return false;
+      if (name === 'include' || name.startsWith('cordis:') || name.startsWith('cordis-')) return false;
+      return MODULE_NAME_RE.test(name);
+    }
+
+    /** Read the mention token for one plugin. @param {string} title @param {string} moduleName @returns {string} */
+    function pluginMentionToken(title, moduleName) {
+      const safe = String(title === undefined || title === null ? moduleName : title)
+        .replace(/[\[\]\n\r]/gu, ' ')
+        .replace(/\s+/gu, ' ')
+        .trim();
+      return `@[${safe === '' ? moduleName : safe}](${MENTION_PREFIX}${moduleName})`;
+    }
+
+    /**
+     * Installed plugins available for `@` completion, from the Host inventory.
+     * @param {any} ctx - client context.
+     * @param {AbortSignal | undefined} signal - completion cancellation.
+     * @returns {Promise<Array<{ moduleName: string, title: string, description?: string }>>}
+     */
+    async function loadPluginRows(ctx, signal) {
+      const now = Date.now();
+      if (pluginRowCache !== undefined && now - pluginRowCache.at < PLUGIN_CACHE_TTL_MS) return pluginRowCache.rows;
+      const remote = ctx.remote;
+      const inventory = remote === undefined || remote === null ? undefined : remote.pluginInventory;
+      if (inventory === undefined || inventory === null || !isFunction(inventory.list)) return [];
+      const result = await inventory.list();
+      if (signal !== undefined && signal.aborted) return [];
+      if (result === undefined || result === null || result.ok !== true) return [];
+      const entries = result.value !== null && typeof result.value === 'object' && Array.isArray(result.value.entries)
+        ? result.value.entries
+        : [];
+      const localeId = currentLocaleId(ctx);
+      const rows = [];
+      const seen = new Set();
+      for (const entry of entries) {
+        if (!isSelectablePlugin(entry)) continue;
+        const moduleName = entry.moduleName;
+        if (seen.has(moduleName)) continue;
+        seen.add(moduleName);
+        const meta = entry.meta !== null && typeof entry.meta === 'object' ? entry.meta : undefined;
+        const title = localizedText(meta === undefined ? undefined : meta.title, localeId);
+        const description = localizedText(meta === undefined ? undefined : meta.description, localeId);
+        rows.push({
+          moduleName,
+          title: title === undefined || title === '' ? moduleName : title,
+          ...description === undefined ? {} : { description },
+        });
+      }
+      rows.sort((left, right) => left.title.localeCompare(right.title));
+      pluginRowCache = { at: now, rows };
+      return rows;
+    }
+
+    /** Translator bound to the plugin namespace, falling back to the key. @param {any} ctx @returns {(key: string) => string} */
+    function createTranslator(ctx) {
+      try {
+        return ctx.locale.bind(NS);
+      } catch (error) {
+        return (key) => key;
+      }
+    }
+
+    /**
+     * One `@` completion source: installed plugins, filtered by the live query.
+     * @param {any} ctx - client context.
+     * @returns {any} the source object consumed by `inputTriggers.registerSource`.
+     */
+    function createPluginSource(ctx) {
+      const t = createTranslator(ctx);
+      return {
+        trigger: '@',
+        name: 'plugin',
+        order: 10,
+        showGroupTitle: false,
+        async candidates(_session, request) {
+          const signal = request === undefined || request === null ? undefined : request.signal;
+          const query = request === undefined || request === null || typeof request.query !== 'string'
+            ? ''
+            : request.query.trim();
+          let rows;
+          try {
+            rows = await loadPluginRows(ctx, signal);
+          } catch (error) {
+            return [];
+          }
+          if (signal !== undefined && signal.aborted) return [];
+          const needle = query.toLocaleLowerCase();
+          const filtered = needle === '' ? rows : rows.filter((row) => row.moduleName.toLocaleLowerCase().includes(needle)
+            || row.title.toLocaleLowerCase().includes(needle)
+            || (row.description === undefined ? false : row.description.toLocaleLowerCase().includes(needle)));
+          const section = t('section.plugins');
+          return filtered.slice(0, 30).map((row) => ({
+            name: row.title,
+            description: row.moduleName,
+            section,
+            value: JSON.stringify({ kind: 'plugin', moduleName: row.moduleName, title: row.title }),
+          }));
+        },
+        onPick(pick) {
+          const candidate = pick === undefined || pick === null ? undefined : pick.candidate;
+          if (candidate === undefined || candidate === null || typeof candidate.value !== 'string') return undefined;
+          let value;
+          try {
+            value = JSON.parse(candidate.value);
+          } catch (error) {
+            return undefined;
+          }
+          if (value === null || typeof value !== 'object' || value.kind !== 'plugin') return undefined;
+          if (typeof value.moduleName !== 'string' || !MODULE_NAME_RE.test(value.moduleName)) return undefined;
+          const title = typeof value.title === 'string' && value.title !== '' ? value.title : value.moduleName;
+          const mention = pluginMentionToken(title, value.moduleName);
+          return {
+            insert: {
+              source: 'plugin',
+              ref: mention,
+              label: title,
+              clipboardText: mention,
+            },
+          };
+        },
+        codec: {
+          clipboardText: (ref) => ref,
+          serialize: (ref) => Promise.resolve(ref),
+        },
+      };
+    }
+
+    /**
+     * Sent-message renderer for one `@plugin` mention: a compact inline chip.
+     * @param {{ node?: { data?: { label?: string, name?: string } }, raw?: string }} props
+     * @returns {any}
+     */
+    function PluginMentionText(props) {
+      const data = props !== undefined && props.node !== undefined ? props.node.data : undefined;
+      const label = data !== undefined && typeof data.label === 'string' && data.label !== '' ? data.label : '';
+      const name = data !== undefined && typeof data.name === 'string' ? data.name : '';
+      const text = label === '' ? (name === '' ? 'plugin' : name) : label;
+      return React.createElement('span', {
+        title: name === '' ? text : `${text} · ${name}`,
+        style: {
+          color: 'var(--dsw-alias-state-business-primary)',
+          background: 'var(--dsw-alias-state-business-tertiary)',
+          borderRadius: 'var(--dsw-radius-sm)',
+          padding: '0 4px',
+          whiteSpace: 'nowrap',
+        },
+      }, React.createElement('span', { 'aria-hidden': true, style: { marginRight: '2px', fontWeight: 500 } }, '@'), text);
+    }
+
+    /**
+     * `userText` matcher for canonical and hand-typed plugin mentions.
+     * @returns {any} the rule object accepted by `uiConversation.userText.register`.
+     */
+    function pluginMentionRule() {
+      return {
+        id: 'plugin',
+        order: 20,
+        match(text, from) {
+          if (typeof text !== 'string') return undefined;
+          const canonical = /@\[([^\]\n]{1,200})\]\(dsh-plugin:([A-Za-z0-9@/._-]+)\)/gu;
+          canonical.lastIndex = from;
+          const first = canonical.exec(text);
+          const shortcut = /@plugin:([A-Za-z0-9@/._-]+)/gu;
+          shortcut.lastIndex = from;
+          const second = shortcut.exec(text);
+          if (first === null && second === null) return undefined;
+          if (second === null || (first !== null && first.index <= second.index)) {
+            return { id: 'plugin', start: first.index, end: first.index + first[0].length, data: { label: first[1], name: first[2] } };
+          }
+          return { id: 'plugin', start: second.index, end: second.index + second[0].length, data: { name: second[1] } };
+        },
+      };
+    }
+
+    /**
+     * Register the mention source, the sent-message rule and its renderer.
+     * @param {any} ctx - client context.
+     */
+    function registerPluginMentions(ctx) {
+      const uiConversation = ctx.get('uiConversation');
+      if (uiConversation !== undefined && uiConversation !== null
+        && uiConversation.userText !== undefined && uiConversation.userText !== null
+        && isFunction(uiConversation.userText.register)) {
+        try {
+          ctx.effect(() => uiConversation.userText.register(pluginMentionRule()), 'composer-draft-cache: @plugin text rule');
+        } catch (error) {
+          /* sent-message rendering is cosmetic; the mention still reaches the model */
+        }
+      }
+      try {
+        ctx.slots.inject('conversation.user.text.node', () => ctx.slots.register({
+          name: 'conversation.user.text.node',
+          key: 'plugin',
+          priority: 100,
+        }, PluginMentionText));
+      } catch (error) {
+        /* renderer is cosmetic */
+      }
+      try {
+        const inputTriggers = ctx.get('inputTriggers');
+        if (inputTriggers !== undefined && inputTriggers !== null && isFunction(inputTriggers.registerSource)) {
+          ctx.effect(() => inputTriggers.registerSource(createPluginSource(ctx)), 'composer-draft-cache: @plugin source');
+        }
+      } catch (error) {
+        /* completion menu is optional; a typed @plugin:name still works */
+      }
+    }
+
     function apply(ctx) {
+      try {
+        ctx.effect(() => ctx.locale.register(NS, { zh: DICT_ZH, en: DICT_EN }), 'composer-draft-cache: dictionaries');
+      } catch (error) {
+        /* locale is cosmetic */
+      }
+      registerPluginMentions(ctx);
+
       /**
        * Read one Session summary synchronously. Used only to decide whether a
        * cached new-session draft came from a Session that has already started.
@@ -329,7 +603,7 @@ window.__ModuleLoader__.load({
           {
             name: 'conversation.input.dock',
             id: DOCK_ENTRY_ID,
-            order: 8,
+            order: 9,
           },
           DraftCacheBridge,
         ),
@@ -337,7 +611,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.name = NAME;
-    exports.inject = ['slots'];
+    exports.inject = ['slots', 'inputTriggers', 'locale', 'remote.pluginInventory', 'uiConversation'];
     exports.apply = apply;
     return module.exports;
   },

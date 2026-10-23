@@ -1,7 +1,8 @@
-# Mount the composer draft cache bundle into the DSH profile.
-# The Host row is intentionally inert: this feature lives entirely in the
-# browser. The package's `dsh.client` section supplies the headless Client
-# entry that remembers each Workspace's unsent new-session draft.
+# Mount the composer toolkit bundle into the DSH profile.
+# The Host row reads the @plugin mention tokens out of the messages entering a
+# step and publishes the selected plugins' metadata as runtime context. The
+# package's `dsh.client` section supplies the composer draft cache, the `@`
+# plugin completion source, and the sent-message mention renderer.
 - insert:
     - id: composer-draft-cache
       name: 'dsh-composer-draft-cache'

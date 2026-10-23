@@ -156,28 +156,76 @@ function createPlugin(options) {
   const react = createReactStub();
   const mod = loadClientGeneration({ storage: options.storage, react });
   const snapshots = options.snapshots;
-  let registered = null;
+  const registrations = [];
+  const sources = [];
+  const rules = [];
+  const localeDicts = [];
+  const inventory = { entries: [] };
   const ctx = {
     get(name) {
       if (name === 'sessions') return { list: { getSnapshot: () => snapshots.sessions } };
+      if (name === 'uiConversation') {
+        return {
+          userText: {
+            register(rule) {
+              rules.push(rule);
+              return () => {};
+            },
+          },
+        };
+      }
+      if (name === 'inputTriggers') {
+        return {
+          registerSource(source) {
+            sources.push(source);
+            return () => {};
+          },
+        };
+      }
       return undefined;
+    },
+    locale: {
+      register(namespace, dicts) {
+        localeDicts.push({ namespace, dicts });
+        return () => {};
+      },
+      bind() {
+        return (key) => ({ 'section.plugins': '插件' }[key] ?? key);
+      },
+      getSnapshot() {
+        return { id: 'zh' };
+      },
+    },
+    remote: {
+      pluginInventory: {
+        async list() {
+          return { ok: true, value: { entries: inventory.entries } };
+        },
+      },
+    },
+    effect(callback) {
+      const dispose = callback();
+      return typeof dispose === 'function' ? dispose : () => {};
     },
     slots: {
       inject(name, callback) {
         return callback();
       },
       register(optionsIn, Component) {
-        registered = { options: optionsIn, Component };
+        registrations.push({ options: optionsIn, Component });
         return () => {};
       },
     },
   };
+  if (options.inventory !== undefined && Array.isArray(options.inventory.entries)) {
+    inventory.entries = options.inventory.entries;
+  }
   mod.apply(ctx);
-  assert.ok(registered !== null, 'apply() must register the dock entry');
-  assert.equal(registered.options.name, 'conversation.input.dock');
-  assert.equal(registered.options.id, 'composer-draft-cache');
-
-  const Component = registered.Component;
+  assert.equal(typeof mod.apply, 'function');
+  const dock = registrations.find((entry) => entry.options.name === 'conversation.input.dock');
+  assert.ok(dock !== undefined, 'apply() must register the dock entry');
+  assert.equal(dock.options.id, 'composer-draft-cache');
+  const Component = dock.Component;
 
   const props = {
     get sessionId() {
@@ -259,6 +307,40 @@ function createPlugin(options) {
     shows(text) {
       return snapshots.input.draft === text;
     },
+    /** Client module inject list (services the client half waits for). */
+    injectList: mod.inject,
+    /** Registered `@` completion sources. */
+    sourceFor(name) {
+      const source = sources.find((entry) => entry.trigger === '@' && entry.name === name);
+      assert.ok(source !== undefined, `@ source "${name}" must be registered`);
+      return source;
+    },
+    /** Run the plugin source's candidate lookup for one query. */
+    async pluginCandidates(query = '') {
+      return this.sourceFor('plugin').candidates({ sessionId: 's-1' }, {
+        query,
+        quoted: false,
+        drilled: false,
+        signal: undefined,
+      });
+    },
+    /** Run the plugin source's pick handler for one candidate row. */
+    pluginPick(row) {
+      return this.sourceFor('plugin').onPick({ candidate: { value: row.value }, action: 'pick' });
+    },
+    /** Match the @plugin sent-message rule against text. */
+    pluginRuleMatch(text) {
+      const rule = rules.find((entry) => entry.id === 'plugin');
+      assert.ok(rule !== undefined, 'the @plugin user-text rule must be registered');
+      return rule.match(text, 0);
+    },
+    /** The registered sent-message renderer for @plugin mentions. */
+    pluginRenderer() {
+      return registrations.find((entry) => entry.options.name === 'conversation.user.text.node'
+        && entry.options.key === 'plugin');
+    },
+    /** Locale dictionaries registered for the plugin namespace. */
+    localeDicts,
   };
 }
 
@@ -529,4 +611,132 @@ test('perf: unrelated composer publishes do not re-run the cache effect', () => 
     plugin.render();
   }
   assert.equal(storage.removeItemCalls, removesAfterOpen, 'a blank composer must not touch storage per publish');
+});
+
+/* ------------------------------------------------------------------ *
+ * @plugin mentions (client half)
+ * ------------------------------------------------------------------ */
+
+function pluginInventory(entries) {
+  return { entries };
+}
+
+test('@plugin: candidates list only enabled community plugins, localized', async () => {
+  const plugin = createPlugin({
+    storage: createStorage(),
+    snapshots: baseSnapshots(),
+    inventory: pluginInventory([
+      { entryId: 'include:ui-theme', moduleName: '@deepseek-ai/dsh-client-ui-theme', enabled: true, fiberPhase: 'active', meta: { title: 'Theme' } },
+      {
+        entryId: 'include:claude-style',
+        moduleName: 'dsh-claude-style',
+        enabled: true,
+        fiberPhase: 'active',
+        meta: {
+          title: { en: 'Claude style', zh: 'Claude 风格' },
+          description: { en: 'A theme', zh: '一个主题' },
+        },
+      },
+      { entryId: 'include:disabled', moduleName: 'dsh-disabled', enabled: false, fiberPhase: null },
+      { entryId: 'include:loading', moduleName: 'dsh-loading', enabled: true, fiberPhase: 'loading' },
+      { entryId: 'include:root', moduleName: 'cordis:include', enabled: true, fiberPhase: 'active' },
+    ]),
+  });
+
+  const rows = await plugin.pluginCandidates('');
+  assert.equal(rows.length, 1, 'core, disabled and non-active entries are not selectable plugins');
+  assert.equal(rows[0].name, 'Claude 风格');
+  assert.equal(rows[0].description, 'dsh-claude-style');
+  assert.equal(rows[0].section, '插件');
+  assert.deepEqual(JSON.parse(rows[0].value), {
+    kind: 'plugin',
+    moduleName: 'dsh-claude-style',
+    title: 'Claude 风格',
+  });
+});
+
+test('@plugin: the menu query filters by title, module name and description', async () => {
+  const plugin = createPlugin({
+    storage: createStorage(),
+    snapshots: baseSnapshots(),
+    inventory: pluginInventory([
+      {
+        entryId: 'include:claude-style',
+        moduleName: 'dsh-claude-style',
+        enabled: true,
+        fiberPhase: 'active',
+        meta: { title: { en: 'Claude style', zh: 'Claude 风格' }, description: { en: 'A theme', zh: '一个主题' } },
+      },
+      {
+        entryId: 'include:better-sidebar',
+        moduleName: 'dsh-better-sidebar',
+        enabled: true,
+        fiberPhase: 'active',
+        meta: { title: { en: 'Better sidebar', zh: '更好的侧栏' }, description: { en: 'Sidebar', zh: '侧栏' } },
+      },
+    ]),
+  });
+
+  const byTitle = await plugin.pluginCandidates('Claude');
+  assert.equal(byTitle.length, 1);
+  assert.equal(JSON.parse(byTitle[0].value).moduleName, 'dsh-claude-style');
+
+  const byModule = await plugin.pluginCandidates('sidebar');
+  assert.equal(byModule.length, 1);
+  assert.equal(JSON.parse(byModule[0].value).moduleName, 'dsh-better-sidebar');
+
+  const byDescription = await plugin.pluginCandidates('主题');
+  assert.equal(byDescription.length, 1);
+  assert.equal(JSON.parse(byDescription[0].value).moduleName, 'dsh-claude-style');
+
+  assert.equal((await plugin.pluginCandidates('nothing-matches')).length, 0);
+});
+
+test('@plugin: a pick inserts an atomic mention chip', async () => {
+  const plugin = createPlugin({
+    storage: createStorage(),
+    snapshots: baseSnapshots(),
+    inventory: pluginInventory([
+      {
+        entryId: 'include:claude-style',
+        moduleName: 'dsh-claude-style',
+        enabled: true,
+        fiberPhase: 'active',
+        meta: { title: { en: 'Claude style', zh: 'Claude 风格' } },
+      },
+    ]),
+  });
+
+  const rows = await plugin.pluginCandidates('');
+  const pick = plugin.pluginPick(rows[0]);
+  assert.equal(pick.insert.source, 'plugin');
+  assert.equal(pick.insert.label, 'Claude 风格');
+  assert.equal(pick.insert.ref, '@[Claude 风格](dsh-plugin:dsh-claude-style)');
+  assert.equal(pick.insert.clipboardText, pick.insert.ref);
+
+  const source = plugin.sourceFor('plugin');
+  assert.equal(await source.codec.serialize(pick.insert.ref), pick.insert.ref);
+  assert.equal(source.codec.clipboardText(pick.insert.ref), pick.insert.ref);
+});
+
+test('@plugin: sent messages expose canonical and hand-typed mentions', () => {
+  const plugin = createPlugin({ storage: createStorage(), snapshots: baseSnapshots() });
+
+  const canonical = '@[Claude 风格](dsh-plugin:dsh-claude-style)';
+  const first = plugin.pluginRuleMatch(`use ${canonical} now`);
+  assert.equal(first.id, 'plugin');
+  assert.equal(first.start, 4);
+  assert.equal(first.end, 4 + canonical.length);
+  assert.equal(first.data.label, 'Claude 风格');
+  assert.equal(first.data.name, 'dsh-claude-style');
+
+  const second = plugin.pluginRuleMatch('hi @plugin:dsh-better-sidebar');
+  assert.equal(second.start, 3);
+  assert.equal(second.data.name, 'dsh-better-sidebar');
+  assert.equal(second.data.label, undefined);
+
+  assert.notEqual(plugin.pluginRenderer(), undefined, 'the @plugin text renderer must be registered');
+  assert.equal(plugin.injectList.includes('inputTriggers'), true);
+  assert.equal(plugin.injectList.includes('remote.pluginInventory'), true);
+  assert.equal(plugin.injectList.includes('uiConversation'), true);
 });

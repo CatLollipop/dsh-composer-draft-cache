@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Composer draft cache",
-    "description": "Remembers unsent message drafts per workspace and per session, restores them after switching away, and drops them once sent or cleared, until the app closes."
+    "title": "Composer toolkit: draft cache + @plugin mentions",
+    "description": "Remembers unsent composer drafts per workspace and per session, and lets you @-mention an installed plugin so the agent uses it for that turn."
   }
 }

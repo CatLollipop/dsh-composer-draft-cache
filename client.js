@@ -198,6 +198,25 @@ window.__ModuleLoader__.load({
       return MODULE_NAME_RE.test(name);
     }
 
+    /** Resolve the client remotes service; dotted inject declarations do not grant the `remote` property. @param {any} ctx @returns {any} */
+    function remoteOf(ctx) {
+      try {
+        const remote = ctx.remote;
+        if (remote !== undefined && remote !== null) return remote;
+      } catch (error) {
+        /* property access is gated by inject; fall back to optional lookup */
+      }
+      try {
+        if (typeof ctx.get === 'function') {
+          const remote = ctx.get('remote');
+          if (remote !== undefined && remote !== null) return remote;
+        }
+      } catch (error) {
+        /* optional lookup unavailable */
+      }
+      return undefined;
+    }
+
     /** Read the mention token for one plugin. @param {string} title @param {string} moduleName @returns {string} */
     function pluginMentionToken(title, moduleName) {
       const safe = String(title === undefined || title === null ? moduleName : title)
@@ -216,7 +235,7 @@ window.__ModuleLoader__.load({
     async function loadPluginRows(ctx, signal) {
       const now = Date.now();
       if (pluginRowCache !== undefined && now - pluginRowCache.at < PLUGIN_CACHE_TTL_MS) return pluginRowCache.rows;
-      const remote = ctx.remote;
+      const remote = remoteOf(ctx);
       const inventory = remote === undefined || remote === null ? undefined : remote.pluginInventory;
       if (inventory === undefined || inventory === null || !isFunction(inventory.list)) return [];
       const result = await inventory.list();
@@ -256,19 +275,27 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Source names tried in order; the first free one publishes the menu group. */
+    const SOURCE_NAMES = ['plugin', 'plugins', 'plugin-mentions'];
+
     /**
-     * One `@` completion source: installed plugins, filtered by the live query.
+     * One `@` completion source. Only the first free name publishes candidates;
+     * extra free names register as quiet aliases so a chip inserted under any of
+     * them keeps a serializer across page reloads.
      * @param {any} ctx - client context.
+     * @param {string} sourceName - the name this source registers under.
+     * @param {boolean} primary - whether this source publishes menu candidates.
      * @returns {any} the source object consumed by `inputTriggers.registerSource`.
      */
-    function createPluginSource(ctx) {
+    function createPluginSource(ctx, sourceName, primary) {
       const t = createTranslator(ctx);
       return {
         trigger: '@',
-        name: 'plugin',
+        name: sourceName,
         order: 10,
         showGroupTitle: false,
         async candidates(_session, request) {
+          if (primary !== true) return [];
           const signal = request === undefined || request === null ? undefined : request.signal;
           const query = request === undefined || request === null || typeof request.query !== 'string'
             ? ''
@@ -307,7 +334,7 @@ window.__ModuleLoader__.load({
           const mention = pluginMentionToken(title, value.moduleName);
           return {
             insert: {
-              source: 'plugin',
+              source: sourceName,
               ref: mention,
               label: title,
               clipboardText: mention,
@@ -373,6 +400,7 @@ window.__ModuleLoader__.load({
      * @param {any} ctx - client context.
      */
     function registerPluginMentions(ctx) {
+      const registered = [];
       const uiConversation = ctx.get('uiConversation');
       if (uiConversation !== undefined && uiConversation !== null
         && uiConversation.userText !== undefined && uiConversation.userText !== null
@@ -395,11 +423,23 @@ window.__ModuleLoader__.load({
       try {
         const inputTriggers = ctx.get('inputTriggers');
         if (inputTriggers !== undefined && inputTriggers !== null && isFunction(inputTriggers.registerSource)) {
-          ctx.effect(() => inputTriggers.registerSource(createPluginSource(ctx)), 'composer-draft-cache: @plugin source');
+          let primaryRegistered = false;
+          for (const sourceName of SOURCE_NAMES) {
+            const source = createPluginSource(ctx, sourceName, primaryRegistered === false);
+            try {
+              ctx.effect(() => inputTriggers.registerSource(source), `composer-draft-cache: @plugin source ${sourceName}`);
+              registered.push(sourceName);
+              if (primaryRegistered === false) primaryRegistered = true;
+            } catch (error) {
+              /* A previous plugin generation may still own this name (client HMR);
+               * try the next name so the menu works without a page reload. */
+            }
+          }
         }
       } catch (error) {
         /* completion menu is optional; a typed @plugin:name still works */
       }
+      return registered;
     }
 
     function apply(ctx) {
@@ -603,7 +643,7 @@ window.__ModuleLoader__.load({
           {
             name: 'conversation.input.dock',
             id: DOCK_ENTRY_ID,
-            order: 9,
+            order: 10,
           },
           DraftCacheBridge,
         ),
@@ -611,7 +651,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.name = NAME;
-    exports.inject = ['slots', 'inputTriggers', 'locale', 'remote.pluginInventory', 'uiConversation'];
+    exports.inject = ['slots', 'inputTriggers', 'locale', 'remote', 'remote.pluginInventory', 'uiConversation'];
     exports.apply = apply;
     return module.exports;
   },

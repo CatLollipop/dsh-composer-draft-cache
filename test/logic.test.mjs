@@ -161,6 +161,7 @@ function createPlugin(options) {
   const rules = [];
   const localeDicts = [];
   const inventory = { entries: [] };
+  const staleSources = Array.isArray(options.staleSources) ? options.staleSources : [];
   const ctx = {
     get(name) {
       if (name === 'sessions') return { list: { getSnapshot: () => snapshots.sessions } };
@@ -177,6 +178,7 @@ function createPlugin(options) {
       if (name === 'inputTriggers') {
         return {
           registerSource(source) {
+            if (staleSources.includes(source.name)) throw new Error(`slash source "@${source.name}" is already registered`);
             sources.push(source);
             return () => {};
           },
@@ -309,24 +311,34 @@ function createPlugin(options) {
     },
     /** Client module inject list (services the client half waits for). */
     injectList: mod.inject,
-    /** Registered `@` completion sources. */
+    /** Registered `@` completion source by name. */
     sourceFor(name) {
       const source = sources.find((entry) => entry.trigger === '@' && entry.name === name);
       assert.ok(source !== undefined, `@ source "${name}" must be registered`);
       return source;
     },
-    /** Run the plugin source's candidate lookup for one query. */
+    /** The source that publishes candidates (the first free name). */
+    primarySource() {
+      const source = sources.find((entry) => entry.trigger === '@');
+      assert.ok(source !== undefined, 'at least one @ source must be registered');
+      return source;
+    },
+    /** Every registered @ source name, in registration order. */
+    sourceNames() {
+      return sources.filter((entry) => entry.trigger === '@').map((entry) => entry.name);
+    },
+    /** Run the primary plugin source's candidate lookup for one query. */
     async pluginCandidates(query = '') {
-      return this.sourceFor('plugin').candidates({ sessionId: 's-1' }, {
+      return this.primarySource().candidates({ sessionId: 's-1' }, {
         query,
         quoted: false,
         drilled: false,
         signal: undefined,
       });
     },
-    /** Run the plugin source's pick handler for one candidate row. */
+    /** Run the primary plugin source's pick handler for one candidate row. */
     pluginPick(row) {
-      return this.sourceFor('plugin').onPick({ candidate: { value: row.value }, action: 'pick' });
+      return this.primarySource().onPick({ candidate: { value: row.value }, action: 'pick' });
     },
     /** Match the @plugin sent-message rule against text. */
     pluginRuleMatch(text) {
@@ -739,4 +751,38 @@ test('@plugin: sent messages expose canonical and hand-typed mentions', () => {
   assert.equal(plugin.injectList.includes('inputTriggers'), true);
   assert.equal(plugin.injectList.includes('remote.pluginInventory'), true);
   assert.equal(plugin.injectList.includes('uiConversation'), true);
+});
+
+test('@plugin: falls back to the next source name when a stale generation owns one', async () => {
+  const plugin = createPlugin({
+    storage: createStorage(),
+    snapshots: baseSnapshots(),
+    staleSources: ['plugin', 'plugins'],
+    inventory: pluginInventory([
+      {
+        entryId: 'include:claude-style',
+        moduleName: 'dsh-claude-style',
+        enabled: true,
+        fiberPhase: 'active',
+        meta: { title: { en: 'Claude style', zh: 'Claude 风格' } },
+      },
+    ]),
+  });
+
+  assert.deepEqual(plugin.sourceNames(), ['plugin-mentions']);
+  const rows = await plugin.pluginCandidates('');
+  assert.equal(rows.length, 1);
+  const pick = plugin.pluginPick(rows[0]);
+  assert.equal(pick.insert.source, 'plugin-mentions');
+  assert.equal(pick.insert.ref, '@[Claude 风格](dsh-plugin:dsh-claude-style)');
+});
+
+test('@plugin: a clean load registers the primary name and quiet aliases', async () => {
+  const plugin = createPlugin({ storage: createStorage(), snapshots: baseSnapshots() });
+  assert.equal(plugin.sourceNames()[0], 'plugin');
+  for (const name of plugin.sourceNames().slice(1)) {
+    const alias = plugin.sourceFor(name);
+    assert.equal((await alias.candidates({}, { query: '', signal: undefined })).length, 0);
+    assert.equal(alias.codec.clipboardText('x'), 'x');
+  }
 });

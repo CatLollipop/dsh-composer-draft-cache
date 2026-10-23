@@ -114,6 +114,10 @@ theme tokens only.
   metadata.
 - The mention selection applies while its turn runs; a later turn without any
   mention clears it.
+- The `@` source registers under `plugin`; on a page that went through several
+  hot reloads of this plugin it may fall back to `plugins` / `plugin-mentions`
+  (and the two extra names exist as serializer aliases). A normal page reload
+  restores the preferred name.
 
 ## Development
 

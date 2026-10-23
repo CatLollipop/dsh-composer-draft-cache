@@ -1,6 +1,6 @@
 {
   "name": "dsh-composer-draft-cache",
-  "version": "1.5.0",
+  "version": "1.5.4",
   "private": true,
   "type": "module",
   "description": "Composer enhancements for DeepSeek Harness: caches unsent drafts per workspace and per session, and lets users @-mention an installed plugin so the agent uses it for that turn.",
